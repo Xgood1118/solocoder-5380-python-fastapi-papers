@@ -1,0 +1,29 @@
+组里做科研的同学每天都要在 arXiv、Crossref、Semantic Scholar 这些学术文献数据库上找论文，每个数据库的 API 都得单独接一遍很烦。我想用 Python 写一个聚合检索服务，对外一个统一接口，框架用 FastAPI，搜索请求进来之后同时去这几家源查询，结果合并去重排序后返回。
+
+服务有几个核心模块要分开。fetcher/ 目录下面放每个数据源的抓取实现，arxiv.py、crossref.py、semantic.py 各自一个文件，定义统一的接口规范：search(query, year_from, year_to, max_results) 返回一个 Paper 列表（Paper 是 dataclass 或者 Pydantic model）。parser/ 目录放解析层，把每家 API 返回的原始 JSON 转换成统一的 Paper 结构（包括 title、authors、abstract、year、doi、url、source、citation_count、venue 这些字段）。aggregator/ 目录放聚合去重逻辑，cache/ 目录放内存缓存。
+
+多源去重是关键难点。同一个论文可能在三个数据库都出现，arXiv 的 2024.12345 跟 DOI 10.xxx/xxx 跟 Semantic Scholar 的 paperId 其实是同一篇。去重算法基于 DOI 完全匹配做第一轮合并，DOI 缺失的时候用标题做模糊匹配（去掉标点、归一化空格、忽略大小写后比较），作者列表第一作者 + 发表年份也作为辅助判定。合并的时候字段取最全的那个（abstract 哪个最完整用哪个，citation_count 取最大那个更新鲜）。
+
+缓存层：用户搜索过的 query 在内存里缓存结果，TTL 5 分钟。同样 query 在 5 分钟内多次请求直接走缓存不查后端。缓存 key 是 (query, year_from, year_to, max_results) 的哈希。缓存要有上限 LRU 淘汰（最多 1000 个 entry），不能无限增长。
+
+引用解析：拿到一篇论文后用户想看"这篇引用了哪些"和"哪些引用了它"。前者各家源都有 references 字段（arXiv 没有，Crossref 跟 Semantic Scholar 有），后者只有 Semantic Scholar 有 citations API 而且不是免费的（要 API key）。引用解析结果也走缓存。
+
+限流跟超时：每家源都设一个 5 秒超时，超时了就当这源不可用继续返回其他源的结果。整个聚合请求最长 10 秒。限流方面，arXiv 公开 API 限制每秒 1 个请求，Crossref 那个 polite pool 要带邮箱（要 User-Agent 头加 mailto），Semantic Scholar 免费层每分钟 100 次请求。加个简单的 token bucket 限流器控制并发。
+
+错误处理：单源失败不影响整体结果，那家在响应里标 unavailable: true 就行。全部源都失败才返回 502。日志要记录每次请求的源耗时、命中条数、缓存命中状态方便排查。
+
+接口设计：GET /api/search?q=xxx&year_from=2020&year_to=2024&limit=20&sources=arxiv,crossref 这种形式。GET /api/paper/{doi_or_id} 拿单篇详情。GET /api/paper/{doi_or_id}/citations 拿引用列表。GET /api/paper/{doi_or_id}/references 拿参考文献列表。POST /api/batch 一批 query 一起查（适合脚本批量用）。
+
+数据模型：Paper 这个结构在内部用 Pydantic 定义，序列化成 JSON 的时候 snake_case 字段名，公开字段稳定不变（这些字段是 API 契约改了用户就崩了）。source 字段是个 list 表示"哪些源贡献了这条"。
+
+数据存储：用户搜索历史、收藏夹（用户可以把感兴趣的论文 pin 起来）放 SQLite 文件里就行，零部署成本。FastAPI 起服务用 uvicorn 跑就行。
+
+坑点提示：Semantic Scholar 的 API key 缺失的时候应该明确报错而不是静默失败。arXiv 的搜索结果里 abstract 字段偶尔会缺失需要兜底空字符串。HTTP 客户端要用 httpx 的 async 接口别用 requests 阻塞整个服务。
+
+搜索结果排序的逻辑。原始的多源结果合并后默认按"相关度"排序——简单的做法是按引用数倒序，复杂的可以基于 query 跟 title/abstract 的相似度评分。两种策略都给一个开关让用户选。--sort citations 走引用数倒序，--sort relevance 走相关度评分，--sort date 走发表时间倒序。
+
+数据模型字段要再丰富一点。Paper 这个结构里：title 字符串、authors 列表（每个作者是 Author 对象包括 name、affiliation、orcid 可选）、abstract 文本、year 整数、venue 字符串（期刊或会议名）、doi 字符串（可空）、arxiv_id 字符串（可空）、url 字符串、citation_count 整数、references_count 整数、source 列表（"arxiv"、 "crossref"、 "semantic_scholar" 之类）、fetched_at 时间戳（用于缓存判断）、raw 字典（保留各家原始响应用于排查）。
+
+接口响应里字段要稳定——不要轻易改字段名。如果内部模型字段变了要做映射。响应外层要有个 meta 字段显示总命中数（合并去重后）、每个源返回了多少、被去重掉多少、耗时多少毫秒。
+
+部署相关。uvicorn 起服务监听 0.0.0.0:8000 或者从环境变量读 PORT。Dockerfile 简洁一点用 python:3.11-slim 基础镜像装好依赖。SQLite 文件挂载到 /data 目录方便备份。日志输出 JSON 格式走 stdout 方便容器日志收集。
