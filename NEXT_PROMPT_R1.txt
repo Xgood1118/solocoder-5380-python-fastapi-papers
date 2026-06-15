@@ -1,0 +1,1 @@
+有一个问题：/api/paper/{doi}/references 和 /api/paper/{doi}/citations 两个端点对所有 DOI 都返回 404 Paper not found，main.py 路由顺序里 get_paper({doi_or_id:path}) 通配贪婪吞掉了 /references /citations 子路径后缀，2 个 PROMPT 明确要求的端点完全不可达。检查修复一下。
