@@ -126,49 +126,6 @@ async def search(
     return result
 
 
-@app.get("/api/paper/{doi_or_id:path}", response_model=PaperDetailResponse)
-async def get_paper(doi_or_id: str):
-    papers: List[Paper] = []
-    source_statuses: List[SourceStatus] = []
-    errors: List[str] = []
-
-    for fetcher in _fetchers:
-        start = time.perf_counter()
-        try:
-            paper = await fetcher.get_paper(doi_or_id)
-            duration = int((time.perf_counter() - start) * 1000)
-            source_statuses.append(
-                SourceStatus(
-                    source=fetcher.name,
-                    available=True,
-                    hit_count=1 if paper else 0,
-                    duration_ms=duration,
-                )
-            )
-            if paper:
-                papers.append(paper)
-        except Exception as exc:
-            duration = int((time.perf_counter() - start) * 1000)
-            errors.append(f"{fetcher.name}: {exc}")
-            source_statuses.append(
-                SourceStatus(
-                    source=fetcher.name,
-                    available=False,
-                    hit_count=0,
-                    duration_ms=duration,
-                    error=str(exc),
-                )
-            )
-
-    if not papers:
-        raise HTTPException(status_code=404, detail=f"Paper not found: {doi_or_id}. Errors: {'; '.join(errors)}")
-
-    merged, _ = _aggregator.dedupe_and_merge(papers)
-    if not merged:
-        raise HTTPException(status_code=404, detail=f"Paper not found: {doi_or_id}")
-    return PaperDetailResponse(data=merged[0])
-
-
 @app.get("/api/paper/{doi_or_id:path}/references", response_model=ReferencesResponse)
 async def get_references(doi_or_id: str, limit: int = Query(100, ge=1, le=500)):
     cache_key = ("references", doi_or_id)
@@ -227,6 +184,49 @@ async def get_citations(doi_or_id: str, limit: int = Query(100, ge=1, le=500)):
         meta={"cache_hit": False, "total": len(merged_cites), "duplicates_removed": dups},
         data=merged_cites[:limit],
     )
+
+
+@app.get("/api/paper/{doi_or_id:path}", response_model=PaperDetailResponse)
+async def get_paper(doi_or_id: str):
+    papers: List[Paper] = []
+    source_statuses: List[SourceStatus] = []
+    errors: List[str] = []
+
+    for fetcher in _fetchers:
+        start = time.perf_counter()
+        try:
+            paper = await fetcher.get_paper(doi_or_id)
+            duration = int((time.perf_counter() - start) * 1000)
+            source_statuses.append(
+                SourceStatus(
+                    source=fetcher.name,
+                    available=True,
+                    hit_count=1 if paper else 0,
+                    duration_ms=duration,
+                )
+            )
+            if paper:
+                papers.append(paper)
+        except Exception as exc:
+            duration = int((time.perf_counter() - start) * 1000)
+            errors.append(f"{fetcher.name}: {exc}")
+            source_statuses.append(
+                SourceStatus(
+                    source=fetcher.name,
+                    available=False,
+                    hit_count=0,
+                    duration_ms=duration,
+                    error=str(exc),
+                )
+            )
+
+    if not papers:
+        raise HTTPException(status_code=404, detail=f"Paper not found: {doi_or_id}. Errors: {'; '.join(errors)}")
+
+    merged, _ = _aggregator.dedupe_and_merge(papers)
+    if not merged:
+        raise HTTPException(status_code=404, detail=f"Paper not found: {doi_or_id}")
+    return PaperDetailResponse(data=merged[0])
 
 
 @app.post("/api/batch")
